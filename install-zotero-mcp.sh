@@ -210,11 +210,77 @@ if [[ "$(uname)" != "Darwin" ]]; then
 fi
 
 # --- Check for Zotero ---
-ZOTERO_FOUND=true
-if [[ -d "/Applications/Zotero.app" ]]; then
+ZOTERO_FOUND=false
+ZOTERO_PATH=""
+ZOTERO_DATA_DIR=""
+
+# Method 1: If Zotero is already running, get the app path from the process.
+# This is the most accurate method — works regardless of install location
+# (standard, custom, user Applications). Falls through silently if not running.
+ZOTERO_PID=$(pgrep -x "Zotero" 2>/dev/null || true)
+if [[ -n "$ZOTERO_PID" ]]; then
+    # Get the app bundle path from the running process
+    ZOTERO_PATH=$(ps -o comm= -p "$ZOTERO_PID" 2>/dev/null | head -1 || true)
+    if [[ -n "$ZOTERO_PATH" && "$ZOTERO_PATH" == *"/Zotero.app/"* ]]; then
+        # ps returns the executable inside the bundle; walk up to the .app
+        ZOTERO_PATH="${ZOTERO_PATH%%/Contents/MacOS/*}"
+        if [[ -d "$ZOTERO_PATH" ]]; then
+            ZOTERO_FOUND=true
+        fi
+    fi
+    # Fallback: use the canonical /Applications path if process detection
+    # gave us something unparseable but we know it's running
+    if [[ "$ZOTERO_FOUND" != true ]]; then
+        for candidate in "/Applications/Zotero.app" "$HOME/Applications/Zotero.app"; do
+            if [[ -d "$candidate" ]]; then
+                ZOTERO_FOUND=true
+                ZOTERO_PATH="$candidate"
+                break
+            fi
+        done
+    fi
+fi
+
+# Method 2: Search common install locations
+if [[ "$ZOTERO_FOUND" != true ]]; then
+    for candidate in "/Applications/Zotero.app" "$HOME/Applications/Zotero.app"; do
+        if [[ -d "$candidate" ]]; then
+            ZOTERO_FOUND=true
+            ZOTERO_PATH="$candidate"
+            break
+        fi
+    done
+fi
+
+# Detect Zotero data directory (where zotero.sqlite lives)
+# Checks prefs.js for custom dataDir first, falls back to default path
+if [[ "$ZOTERO_FOUND" == true ]]; then
+    # Try prefs.js first (supports users who moved their data directory)
+    PREFS_DIR="$HOME/Library/Application Support/Zotero/Profiles"
+    if [[ -d "$PREFS_DIR" ]]; then
+        while IFS= read -r -d '' prefs_js; do
+            DATA_DIR_LINE=$(grep -o 'extensions\.zotero\.dataDir",\s*"[^"]*"' "$prefs_js" 2>/dev/null | head -1 || true)
+            if [[ -n "$DATA_DIR_LINE" ]]; then
+                CANDIDATE=$(echo "$DATA_DIR_LINE" | sed 's/.*",\s*"//;s/"$//;s/\\\\/\//g')
+                if [[ -d "$CANDIDATE" ]]; then
+                    ZOTERO_DATA_DIR="$CANDIDATE"
+                    break
+                fi
+            fi
+        done < <(find "$PREFS_DIR" -name "prefs.js" -print0 2>/dev/null)
+    fi
+    # Fallback to default path
+    if [[ -z "$ZOTERO_DATA_DIR" && -d "$HOME/Zotero" ]]; then
+        ZOTERO_DATA_DIR="$HOME/Zotero"
+    fi
+fi
+
+if [[ "$ZOTERO_FOUND" == true ]]; then
     success "Zotero desktop app found"
+    if [[ -n "$ZOTERO_DATA_DIR" ]]; then
+        info "Zotero data directory: $ZOTERO_DATA_DIR"
+    fi
 else
-    ZOTERO_FOUND=false
     echo ""
     warn "Zotero was not detected on this computer."
     echo ""
@@ -928,6 +994,9 @@ if [[ "$ACCESS_MODE" == "web" ]]; then
     _env_add "ZOTERO_LIBRARY_TYPE" "user"
 else
     _env_add "ZOTERO_LOCAL" "true"
+    if [[ -n "$ZOTERO_DATA_DIR" ]]; then
+        _env_add "ZOTERO_DATA_DIR" "$ZOTERO_DATA_DIR"
+    fi
     if [[ -n "$ENABLE_WRITE_SUPPORT" ]] && [[ -n "$ZOTERO_API_KEY" ]] && [[ -n "$ZOTERO_LIBRARY_ID" ]]; then
         _env_add "ZOTERO_API_KEY"      "$ZOTERO_API_KEY"
         _env_add "ZOTERO_LIBRARY_ID"   "$ZOTERO_LIBRARY_ID"

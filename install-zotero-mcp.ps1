@@ -159,19 +159,90 @@ Section "Checking Prerequisites"
 
 # --- Check for Zotero ---
 $ZoteroFound = $false
-$pf86 = ${env:ProgramFiles(x86)}
-$ZoteroPaths = @(
-    "$env:ProgramFiles\Zotero\zotero.exe",
-    "$env:LOCALAPPDATA\Zotero\zotero.exe"
-)
-if ($pf86) { $ZoteroPaths += "$pf86\Zotero\zotero.exe" }
+$ZoteroPath = ""
 
-foreach ($p in $ZoteroPaths) {
-    if (Test-Path $p) { $ZoteroFound = $true; break }
+# Method 1: If Zotero is already running, get path from the process.
+# This is the most accurate method — works regardless of install location
+# (standard, custom, portable). Falls through silently if not running.
+$zoteroProc = Get-Process -Name "zotero" -ErrorAction SilentlyContinue
+if ($zoteroProc -and $zoteroProc.Path) {
+    $candidate = $zoteroProc.Path
+    if (Test-Path $candidate) {
+        $ZoteroFound = $true
+        $ZoteroPath = $candidate
+    }
+}
+
+# Method 2: Search registry for Zotero installation (supports custom install paths)
+if (-not $ZoteroFound) {
+    $regUninstallKeys = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
+    )
+    foreach ($regKey in $regUninstallKeys) {
+        $zoteroReg = Get-ItemProperty -Path $regKey -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -eq "Zotero" }
+        if ($zoteroReg -and $zoteroReg.InstallLocation) {
+            $candidate = Join-Path $zoteroReg.InstallLocation "zotero.exe"
+            if (Test-Path $candidate) {
+                $ZoteroFound = $true
+                $ZoteroPath = $candidate
+                break
+            }
+        }
+    }
+}
+
+# Method 3: Fallback to common fixed paths
+if (-not $ZoteroFound) {
+    $pf86 = ${env:ProgramFiles(x86)}
+    $ZoteroPaths = @(
+        "$env:ProgramFiles\Zotero\zotero.exe",
+        "$env:LOCALAPPDATA\Zotero\zotero.exe"
+    )
+    if ($pf86) { $ZoteroPaths += "$pf86\Zotero\zotero.exe" }
+
+    foreach ($p in $ZoteroPaths) {
+        if (Test-Path $p) {
+            $ZoteroFound = $true
+            $ZoteroPath = $p
+            break
+        }
+    }
+}
+
+# Detect Zotero data directory (where zotero.sqlite lives)
+# Checks prefs.js for custom dataDir first, falls back to default path
+$ZoteroDataDir = ""
+if ($ZoteroFound) {
+    # Try prefs.js first (supports users who moved their data directory)
+    $prefsDir = "$env:APPDATA\Zotero\Zotero\Profiles"
+    if (Test-Path $prefsDir) {
+        $prefsFiles = Get-ChildItem -Path "$prefsDir\*\prefs.js" -ErrorAction SilentlyContinue
+        foreach ($pf in $prefsFiles) {
+            $match = Select-String -Path $pf.FullName -Pattern 'extensions\.zotero\.dataDir",\s*"([^"]+)"' -ErrorAction SilentlyContinue
+            if ($match -and $match.Matches.Groups[1].Value) {
+                $candidate = $match.Matches.Groups[1].Value -replace '\\\\', '\'
+                if (Test-Path $candidate) {
+                    $ZoteroDataDir = $candidate
+                    break
+                }
+            }
+        }
+    }
+    # Fallback to default path
+    if (-not $ZoteroDataDir) {
+        $defaultData = "$env:USERPROFILE\Zotero"
+        if (Test-Path $defaultData) { $ZoteroDataDir = $defaultData }
+    }
 }
 
 if ($ZoteroFound) {
     Success "Zotero desktop app found"
+    if ($ZoteroDataDir) {
+        Info "Zotero data directory: $ZoteroDataDir"
+    }
+}
 } else {
     Write-Host ""
     Warn "Zotero was not detected on this computer."
@@ -801,6 +872,9 @@ $envObj = @{ ZOTERO_LOCAL = "true" }
 if ($AccessMode -eq "web") {
     $envObj = @{}
 }
+if ($ZoteroDataDir) {
+    $envObj["ZOTERO_DATA_DIR"] = $ZoteroDataDir
+}
 if ($EnableWrite -and $ApiKey -and $LibraryId) {
     $envObj["ZOTERO_API_KEY"] = $ApiKey
     $envObj["ZOTERO_LIBRARY_ID"] = $LibraryId
@@ -973,15 +1047,23 @@ if ($BuildDb) {
 
     if ($BuildDb) {
         # Retry loop for Zotero connectivity
+        # Uses .NET HttpWebRequest directly because PowerShell 5.1's
+        # Invoke-WebRequest does not handle Zotero's HTTP/1.0 server correctly.
         $connected = $false
         while (-not $connected) {
             $zoteroStatus = "not_running"
             try {
-                $response = Invoke-WebRequest -Uri "http://127.0.0.1:23119/api/users/0/items?limit=1" -TimeoutSec 2 -UseBasicParsing -ErrorAction Stop
+                $req = [System.Net.HttpWebRequest]::Create("http://127.0.0.1:23119/api/users/0/items?limit=1")
+                $req.Timeout = 2000
+                $req.ServicePoint.Expect100Continue = $false
+                $req.KeepAlive = $false
+                $req.ProtocolVersion = [System.Net.HttpVersion]::Version11
+                $resp = $req.GetResponse()
                 $connected = $true
                 $zoteroStatus = "ready"
-            } catch {
-                if ($_.Exception.Response -and $_.Exception.Response.StatusCode.value__ -eq 403) {
+                $resp.Close()
+            } catch [System.Net.WebException] {
+                if ($_.Exception.Response -and [int]$_.Exception.Response.StatusCode -eq 403) {
                     $zoteroStatus = "api_disabled"
                 }
             }

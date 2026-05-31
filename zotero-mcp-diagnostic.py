@@ -341,6 +341,12 @@ def check_claude_config():
             env_warnings.append("ZOTERO_LIBRARY_ID is empty")
         elif not str(lid).isdigit():
             env_warnings.append(f"ZOTERO_LIBRARY_ID is not numeric: {lid}")
+    if "ZOTERO_DATA_DIR" in env:
+        data_dir = env["ZOTERO_DATA_DIR"]
+        if not data_dir or not data_dir.strip():
+            env_warnings.append("ZOTERO_DATA_DIR is empty")
+        elif not os.path.isdir(data_dir):
+            env_warnings.append(f"ZOTERO_DATA_DIR not found: {data_dir}")
 
     if env_warnings:
         return "claude-config", "WARN", "; ".join(env_warnings), info
@@ -387,6 +393,161 @@ def check_semantic_config():
         return "semantic-config", "WARN", f"Invalid JSON: {e}", info
     except Exception as e:
         return "semantic-config", "FAIL", str(e), info
+
+
+def check_zotero_install():
+    """Check Zotero installation location and data directory.
+
+    Uses a multi-tier approach mirroring the improved install script:
+      1. Process detection (most accurate — works regardless of install method)
+      2. Registry (Windows) / common paths (Mac)
+      3. Fixed fallback paths
+
+    Also detects the Zotero data directory (where zotero.sqlite lives)
+    via prefs.js, with a fallback to the default path.
+    """
+    info = {}
+    zotero_path = ""
+    zotero_running = False
+
+    if IS_MAC:
+        # Method 1: pgrep — Zotero is running
+        stdout, _, rc = _run(["pgrep", "-x", "Zotero"], timeout=3)
+        if rc == 0 and stdout.strip():
+            zotero_running = True
+            pid = stdout.strip().split("\n")[0]
+            # Get the app bundle path from the running process
+            ps_out, _, _ = _run(["ps", "-o", "comm=", "-p", pid], timeout=3)
+            if ps_out and "/Zotero.app/" in ps_out:
+                zotero_path = ps_out.split("/Contents/MacOS/")[0]
+                if not os.path.isdir(zotero_path):
+                    zotero_path = ""
+
+        # Method 2: Common install locations
+        if not zotero_path:
+            for candidate in [
+                "/Applications/Zotero.app",
+                os.path.expanduser("~/Applications/Zotero.app"),
+            ]:
+                if os.path.isdir(candidate):
+                    zotero_path = candidate
+                    break
+
+        info["exe_path"] = os.path.join(zotero_path, "Contents", "MacOS", "zotero") if zotero_path else ""
+    else:
+        # Windows
+        # Method 1: Check if Zotero is running via tasklist
+        stdout, _, rc = _run(
+            ["tasklist", "/FI", "IMAGENAME eq zotero.exe", "/NH", "/FO", "CSV"],
+            timeout=5)
+        if rc == 0 and "zotero.exe" in stdout.lower():
+            zotero_running = True
+            # Try to get path from WMIC
+            wmic_out, _, wmic_rc = _run(
+                ["wmic", "process", "where", "name='zotero.exe'", "get", "ExecutablePath"],
+                timeout=5)
+            if wmic_rc == 0 and wmic_out:
+                for line in wmic_out.split("\n"):
+                    line = line.strip()
+                    if line.lower().endswith("zotero.exe") and os.path.isfile(line):
+                        zotero_path = line
+                        break
+
+        # Method 2: Search registry for Zotero installation
+        if not zotero_path:
+            for reg_key in [
+                r"HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+                r"HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
+                r"HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+            ]:
+                # Use PowerShell to query registry (subprocess-friendly)
+                ps_cmd = (
+                    f'Get-ItemProperty -Path "{reg_key}" -ErrorAction SilentlyContinue | '
+                    'Where-Object { $_.DisplayName -eq "Zotero" } | '
+                    "Select-Object -ExpandProperty InstallLocation"
+                )
+                reg_out, _, reg_rc = _run(
+                    ["powershell", "-NoProfile", "-Command", ps_cmd], timeout=10)
+                if reg_rc == 0 and reg_out.strip():
+                    candidate = os.path.join(reg_out.strip(), "zotero.exe")
+                    if os.path.isfile(candidate):
+                        zotero_path = candidate
+                        break
+
+        # Method 3: Fallback to common fixed paths
+        if not zotero_path:
+            pf86 = os.environ.get("ProgramFiles(x86)", "")
+            candidates = []
+            for base in [
+                os.environ.get("ProgramFiles", ""),
+                os.environ.get("LOCALAPPDATA", ""),
+            ]:
+                if base:
+                    candidates.append(os.path.join(base, "Zotero", "zotero.exe"))
+            if pf86:
+                candidates.append(os.path.join(pf86, "Zotero", "zotero.exe"))
+            for c in candidates:
+                if os.path.isfile(c):
+                    zotero_path = c
+                    break
+
+        info["exe_path"] = zotero_path
+
+    info["installed"] = zotero_path != ""
+    info["running"] = zotero_running
+
+    # Detect Zotero data directory (where zotero.sqlite lives)
+    data_dir = ""
+    if IS_MAC:
+        prefs_base = os.path.expanduser(
+            "~/Library/Application Support/Zotero/Profiles")
+    else:
+        prefs_base = os.path.join(os.environ.get("APPDATA", ""),
+                                  "Zotero", "Zotero", "Profiles")
+
+    # Try prefs.js first (supports users who moved their data directory)
+    if os.path.isdir(prefs_base):
+        import re
+        data_dir_re = re.compile(
+            r'extensions\.zotero\.dataDir",\s*"([^"]+)"')
+        for root, dirs, files in os.walk(prefs_base):
+            for fn in files:
+                if fn == "prefs.js":
+                    try:
+                        with open(os.path.join(root, fn),
+                                  encoding="utf-8", errors="ignore") as pf:
+                            content = pf.read()
+                        m = data_dir_re.search(content)
+                        if m:
+                            candidate = m.group(1).replace("\\\\", "\\")
+                            if os.path.isdir(candidate):
+                                data_dir = candidate
+                                break
+                    except Exception:
+                        pass
+            if data_dir:
+                break
+
+    # Fallback to default path
+    if not data_dir:
+        default = os.path.expanduser("~/Zotero")
+        if os.path.isdir(default):
+            data_dir = default
+
+    info["data_dir"] = data_dir
+    info["data_dir_found"] = data_dir != ""
+
+    if not info["installed"]:
+        return ("zotero-install", "WARN",
+                "Zotero desktop app not found",
+                info)
+
+    detail = f"Found at {zotero_path}"
+    if zotero_running:
+        detail += " (running)"
+    if data_dir:
+        detail += f"; data dir: {data_dir}"
+    return ("zotero-install", "OK", detail, info)
 
 
 def check_zotero_local():
@@ -649,6 +810,7 @@ ALL_CHECKS = [
     ("Checking system environment", check_system),
     ("Checking uv", check_uv),
     ("Checking git", check_git),
+    ("Checking Zotero installation", check_zotero_install),
     ("Checking zotero-mcp", check_zotero_mcp),
     ("Checking dependencies", check_dependencies),
     ("Checking Claude config", check_claude_config),
@@ -781,7 +943,14 @@ def format_report(results, install_log=None):
     lines.append("ZOTERO")
     lines.append("=" * 50)
     for name, status, detail, info in results:
-        if name == "zotero-local":
+        if name == "zotero-install":
+            lines.append(f"  App:          {'Found' if info.get('installed') else 'Not found'}")
+            if info.get("exe_path"):
+                lines.append(f"  Path:         {info['exe_path']}")
+            lines.append(f"  Running:      {info.get('running', False)}")
+            if info.get("data_dir"):
+                lines.append(f"  Data dir:     {info['data_dir']}")
+        elif name == "zotero-local":
             lines.append(f"  Local API:    {'Responding' if info.get('responding') else 'Not responding'}")
         elif name == "zotero-api":
             reachable = info.get("reachable", False)

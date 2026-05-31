@@ -1350,16 +1350,47 @@ class InstallerAPI:
     def check_prerequisites(self):
         results = {}
         if self.is_mac:
-            results["zotero"] = os.path.isdir("/Applications/Zotero.app")
+            # Method 1: Process detection — most accurate, works for any install method
+            zotero_found = False
+            try:
+                proc = subprocess.run(
+                    ["pgrep", "-x", "Zotero"], capture_output=True, text=True, timeout=3)
+                if proc.returncode == 0 and proc.stdout.strip():
+                    zotero_found = True
+            except Exception:
+                pass
+            # Method 2: Common install locations
+            if not zotero_found:
+                for candidate in [
+                    "/Applications/Zotero.app",
+                    os.path.expanduser("~/Applications/Zotero.app"),
+                ]:
+                    if os.path.isdir(candidate):
+                        zotero_found = True
+                        break
+            results["zotero"] = zotero_found
             results["claude"] = os.path.isdir(
                 os.path.expanduser("~/Library/Application Support/Claude"))
         else:
-            results["zotero"] = any(
-                os.path.isfile(os.path.join(p, "Zotero", "zotero.exe"))
-                for p in [os.environ.get("ProgramFiles", ""),
-                          os.environ.get("ProgramFiles(x86)", ""),
-                          os.environ.get("LOCALAPPDATA", "")]
-                if p)
+            # Windows: Method 1 — Process detection
+            zotero_found = False
+            try:
+                proc = subprocess.run(
+                    ["tasklist", "/FI", "IMAGENAME eq zotero.exe", "/NH"],
+                    capture_output=True, text=True, timeout=5)
+                if "zotero.exe" in proc.stdout.lower():
+                    zotero_found = True
+            except Exception:
+                pass
+            # Method 2: Common install paths
+            if not zotero_found:
+                zotero_found = any(
+                    os.path.isfile(os.path.join(p, "Zotero", "zotero.exe"))
+                    for p in [os.environ.get("ProgramFiles", ""),
+                              os.environ.get("ProgramFiles(x86)", ""),
+                              os.environ.get("LOCALAPPDATA", "")]
+                    if p)
+            results["zotero"] = zotero_found
             results["claude"] = os.path.isdir(
                 os.path.join(os.environ.get("APPDATA", ""), "Claude"))
         results["git"] = shutil.which("git") is not None
@@ -1368,7 +1399,54 @@ class InstallerAPI:
                          or os.path.isfile(os.path.expanduser(f"~/.local/bin/{uv_exe}"))
                          or os.path.isfile(os.path.expanduser(f"~/.cargo/bin/{uv_exe}")))
         results["existing_credentials"] = self._get_existing_credentials()
+        # Also detect data directory for later use
+        results["zotero_data_dir"] = self._detect_zotero_data_dir()
         return results
+
+    def _detect_zotero_data_dir(self):
+        """Detect the Zotero data directory (where zotero.sqlite lives).
+
+        Checks prefs.js for a custom dataDir first, falls back to the default
+        path. Mirrors the improved install script's multi-tier approach.
+
+        Returns the detected path as a string, or empty string if not found.
+        """
+        if self.is_mac:
+            prefs_base = os.path.expanduser(
+                "~/Library/Application Support/Zotero/Profiles")
+        else:
+            prefs_base = os.path.join(
+                os.environ.get("APPDATA", ""), "Zotero", "Zotero", "Profiles")
+
+        # Try prefs.js first (supports users who moved their data directory)
+        if os.path.isdir(prefs_base):
+            import re
+            data_dir_re = re.compile(
+                r'extensions\.zotero\.dataDir",\s*"([^"]+)"')
+            for root, dirs, files in os.walk(prefs_base):
+                for fn in files:
+                    if fn == "prefs.js":
+                        try:
+                            with open(os.path.join(root, fn),
+                                      encoding="utf-8", errors="ignore") as pf:
+                                content = pf.read()
+                            m = data_dir_re.search(content)
+                            if m:
+                                candidate = m.group(1).replace("\\\\", "\\")
+                                if self.is_mac:
+                                    candidate = candidate.replace("\\\\", "/")
+                                if os.path.isdir(candidate):
+                                    return candidate
+                        except Exception:
+                            pass
+                # Only check the first profile's prefs.js
+                break
+
+        # Fallback to default path
+        default = os.path.expanduser("~/Zotero")
+        if os.path.isdir(default):
+            return default
+        return ""
 
     def _get_existing_credentials(self):
         """Return the existing Zotero MCP credentials, if any.
@@ -2025,10 +2103,12 @@ class InstallerAPI:
                         f"Other MCP servers may need to be re-added from the backup.")
                     self._log("Existing config had errors — backup saved", "warning")
 
+            data_dir = self._detect_zotero_data_dir()
             env_vars = self._build_zotero_env_vars(
                 api_key, library_id, annotation_limit, use_secret,
                 embedding_model=embedding_model, openai_variant=openai_variant,
-                openai_key=openai_key, gemini_key=gemini_key)
+                openai_key=openai_key, gemini_key=gemini_key,
+                data_dir=data_dir)
 
             existing.setdefault("mcpServers", {})
             existing["mcpServers"]["zotero"] = {"command": mcp_path, "env": env_vars}
@@ -2249,7 +2329,7 @@ class InstallerAPI:
 
     def _build_zotero_env_vars(self, api_key, library_id, annotation_limit, use_secret,
                                embedding_model="local", openai_variant="small",
-                               openai_key="", gemini_key=""):
+                               openai_key="", gemini_key="", data_dir=""):
         """Build the env block that goes into the zotero MCP server config.
 
         Pure function — no side effects, no I/O. Extracted for testability.
@@ -2263,8 +2343,12 @@ class InstallerAPI:
           OPENAI_EMBEDDING_MODEL. Empty key is allowed — zotero-mcp will surface
           the missing-key error at first index time.
         - For "gemini": wires GEMINI_API_KEY; model name defaults at runtime.
+        - data_dir: if non-empty, written as ZOTERO_DATA_DIR so the MCP server
+          can locate a custom data directory (e.g. migrated via prefs.js).
         """
         env_vars = {"ZOTERO_LOCAL": "true"}
+        if data_dir:
+            env_vars["ZOTERO_DATA_DIR"] = data_dir
         if api_key and library_id:
             env_vars["ZOTERO_API_KEY"] = api_key
             env_vars["ZOTERO_LIBRARY_ID"] = library_id
